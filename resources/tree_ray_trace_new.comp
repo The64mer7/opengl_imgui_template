@@ -1,0 +1,1062 @@
+#version 450 core
+#extension GL_ARB_gpu_shader_int64 : enable
+#extension GL_ARB_shader_clock : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba8, binding = 0) uniform image2D u_ScreenImage;
+
+uniform mat4 u_InvView;
+uniform mat4 u_InvProj;
+uniform vec3 u_CameraPosition;
+uniform int u_RenderMode;
+uniform int u_TraceVersion;
+uniform ivec3 u_chunk_counts;
+
+layout(std430, binding = 0) buffer ContreeRayLookupTable
+{
+    uint64_t table[];
+};
+
+struct TreeNode
+{
+    uint data;
+    uint ChildMask0;
+    uint ChildMask1;
+    uint ChildIndex;
+    uint parent;
+};
+
+const uint sizeof_TreeNode = 20;
+
+
+layout(std430, binding = 1) buffer TreeNodes
+{
+    TreeNode node_buffer[];
+} nodes;
+
+struct ChunkData
+{   
+    uint root_idx;
+    uint num_nodes;
+};
+
+layout(std430, binding = 2) buffer Chunks
+{
+    ChunkData chunks[];
+} chunks;
+
+
+bool is_valid_chunk(ChunkData chunk_data)
+{
+    return chunk_data.num_nodes != 0u;
+}
+
+
+uint total_branches = 0u;
+uint divergent_branches = 0u;
+
+bool measure_branch(bool cond)
+{
+    uint bits = subgroupBallotBitCount(subgroupBallot(cond));
+    uint size = gl_SubgroupSize;
+    
+    total_branches++;
+    
+    // If not everyone agreed (i.e., it split), count it as a divergence
+    if (bits > 0u && bits < size)
+    {
+        divergent_branches++;
+    }
+    
+    return cond;
+}
+
+#define IF(cond) if (measure_branch(cond))
+
+float get_branch_efficiency()
+{
+    if (total_branches == 0u) return 1.0;
+    return 1.0 - (float(divergent_branches) / float(total_branches));
+}
+
+bool ray_cube_aabb(
+    vec3 ro,
+    vec3 rd,
+    vec3 aabb_min,
+    float size,
+    out float t_entry,
+    out float t_exit,
+    out int axis
+) 
+{
+    vec3 aabb_max = aabb_min + vec3(size);
+    vec3 ird = 1.0f / rd;
+
+    vec3 tmin = (aabb_min - ro) * ird;
+    vec3 tmax = (aabb_max - ro) * ird;
+
+    vec3 t_entries = min(tmin, tmax);
+    vec3 t_exits = max(tmin, tmax);
+
+    t_entry = max(t_entries.x, max(t_entries.y, t_entries.z));
+    t_exit = min(t_exits.x, min(t_exits.y, t_exits.z));
+
+    axis = (t_entry == t_entries.x) ? 0 : ((t_entry == t_entries.y) ? 1 : 2);
+
+    t_entry = max(t_entry, 0.0f);
+    return t_entry <= t_exit;
+}
+
+bool ray_aabb_intersect(
+    vec3 ro,
+    vec3 rd,
+    vec3 aabb_min,
+    vec3 aabb_max
+) 
+{
+    vec3 ird = 1.0f / rd;
+
+    vec3 tmin = (aabb_min - ro) * ird;
+    vec3 tmax = (aabb_max - ro) * ird;
+
+    vec3 t_entries = min(tmin, tmax);
+    vec3 t_exits = max(tmin, tmax);
+
+    float t_entry = max(t_entries.x, max(t_entries.y, t_entries.z));
+    float t_exit = min(t_exits.x, min(t_exits.y, t_exits.z));
+
+    t_entry = max(t_entry, 0.0f);
+    return t_entry <= t_exit;
+}
+
+
+
+int coord_to_index(ivec3 c)
+{
+    return c.x + 4*c.y + 16*c.z;
+}
+
+
+uint64_t get_children_along_ray(ivec3 c0, ivec3 c1)
+{
+    int i0 = coord_to_index(c0);
+    int i1 = coord_to_index(c1);
+
+    int i = i1 + (4*4*4)*i0;
+
+    return table[i];
+}
+
+bool did_hit(vec2 t)
+{
+    return t.x <= t.y && t.y >= 0.0f;
+}
+
+vec3 iron_bow_palette(float t) 
+{
+    vec3 col;
+    col.x = 1.3270999099f * t * t * t - 3.89901684973f * t * t + 3.70960910156f * t - 0.15278320312f;
+    col.y = 7.65954617763f * t * t * t * t * t - 22.5537957158f * t * t * t * t + 21.3487765665f * t * t * t - 5.91855168371f * t * t + 0.47468132421f * t - 0.00631664062f;
+    col.z = 0.56412587921f * t * t * t * t * t - 1.4419923514f * t * t * t * t + 13.304582114f * t * t * t - 17.0301531828f * t * t + 5.49549730469f * t + 0.1190078125f;
+    return col;
+}
+
+uint branch_seed = 191122u;
+
+#define ENABLE_BRANCH_LOGGING 0
+
+#if ENABLE_BRANCH_LOGGING
+void branch(uint branch_id)
+{
+    branch_seed ^= branch_id;
+    branch_seed *= 1681781941u;
+    branch_seed = (branch_seed >> 11) | (branch_seed << 22);
+}
+#else
+    #define branch(branch_id) do {} while (false)
+#endif
+
+float branch_value()
+{
+    return branch_seed / float(0xffffffffu);
+}
+
+vec3 branch_color()
+{
+    vec3 c;
+    c.r = ((branch_seed >> 0) & 0xff) / float(0xff);
+    c.g = ((branch_seed >> 8) & 0xff) / float(0xff);
+    c.b = ((branch_seed >> 16) & 0xff) / float(0xff);
+    return c;
+}
+
+#define T_MISS (-1.0)
+
+struct raymarch_hit
+{
+    float t;
+    uint data;
+    vec3 normal;
+    int iteration_count;
+};
+
+struct TraversalState
+{
+    ivec3 coord;
+    uint node_idx;
+    float node_size;
+    vec3 plane_pos;
+    vec3 side_dist;
+    uint depth;
+};
+
+float compMin(vec3 v)
+{
+    return min(v.x, min(v.y, v.z));
+}
+
+float compMax(vec3 v)
+{
+    return max(v.x, max(v.y, v.z));
+}
+
+vec3 get_safe_ird(vec3 rd)
+{
+    vec3 safe_sign = mix(vec3(-1.0), vec3(1.0), greaterThanEqual(rd, vec3(0.0)));
+    vec3 safe_abs_rd = max(vec3(1e-5), abs(rd));
+    return safe_sign / safe_abs_rd;
+}
+
+vec3 get_min_mask(vec3 v)
+{
+    float m = compMin(v);
+    return vec3(
+        (v.x == m) ? 1.0 : 0.0,
+        (v.y == m) ? 1.0 : 0.0,
+        (v.z == m) ? 1.0 : 0.0
+    );
+}
+
+void advance_plane(inout vec3 plane, inout vec3 side_dist, inout ivec3 map, vec3 srd,
+                   vec3 delta_dist, float size)
+{
+    vec3 min_mask = get_min_mask(side_dist);
+    plane += min_mask * size * srd;
+    side_dist += min_mask * size * delta_dist;
+    map += ivec3(min_mask * srd);
+}
+
+uint flatten_index(ivec3 c, int axis_branching_factor)
+{
+    return uint(c.x + c.y * axis_branching_factor + c.z * axis_branching_factor * axis_branching_factor);
+}
+
+ivec3 coord_from_world(vec3 wp, float size) 
+{ 
+    return ivec3(floor(wp / size)); 
+}
+
+vec3 quantize_world(vec3 wp, float size) 
+{ 
+    return floor(wp / size) * size; 
+}
+
+ivec3 get_local_coord(ivec3 coord, int axis_branching_factor)
+{
+    return coord % axis_branching_factor;
+}
+
+ivec3 get_child_coord(ivec3 coord, ivec3 local, int axis_branching_factor)
+{
+    return coord * axis_branching_factor + local;
+}
+
+ivec3 get_parent_coord(ivec3 coord, int axis_branching_factor)
+{
+    return coord / axis_branching_factor;
+}
+
+vec3 plane_from_coord(ivec3 coord, float size, ivec3 pos_rd)
+{
+    return vec3(coord + pos_rd) * size;
+}
+
+vec3 plane_dist(vec3 plane_pos, vec3 ro, vec3 ird)
+{
+    return (plane_pos - ro) * ird;
+}
+
+vec3 pos_along_ray(vec3 ro, vec3 rd, float t) 
+{ 
+    return ro + rd * t; 
+}
+
+uint get_child_offset(TreeNode node, uint bit_index)
+{
+    uint is_upper_mask = uint(bit_index >= 32u);
+    uint bit = bit_index & 31u;
+    uint lower_bits = (1u << bit) - 1u;
+    uint lower_offset = bitCount(node.ChildMask0 & lower_bits);
+    uint upper_offset = bitCount(node.ChildMask0) + bitCount(node.ChildMask1 & lower_bits);
+    return lower_offset * (1u - is_upper_mask) + upper_offset * is_upper_mask;
+}
+
+uint get_child_ptr(TreeNode node, uint bit_index)
+{
+    return node.ChildIndex + get_child_offset(node, bit_index);
+}
+
+bool contains_child(TreeNode node, uint index)
+{
+    uint is_upper_mask = uint(index >= 32u);
+    uint bit = 1u << (index & 31u);
+    uint lower_present = (node.ChildMask0 & bit) >> (index & 31u);
+    uint upper_present = (node.ChildMask1 & bit) >> (index & 31u);
+    return ((lower_present & (1u - is_upper_mask)) |
+            (upper_present & is_upper_mask)) != 0u;
+}
+
+bool is_leaf_node(TreeNode node)
+{
+    return (node.ChildMask0 | node.ChildMask1) == 0u;
+}
+
+#define OPTIMIZE_FLAG_NONE 0
+#define OPTIMIZE_FLAG_LUT 1
+
+bool coord_in_bounds(ivec3 c, int d)
+{
+    int max_c = 1 << (2*d);
+    return all(lessThan(uvec3(c), uvec3(max_c)));
+}
+
+bool coord_in_bounds_lod(ivec3 c, uint depth, uint axis_branching_factor)
+{
+    uint log2_factor = findMSB(axis_branching_factor);
+    uint max_c = 1u << (log2_factor * depth);
+    return all(lessThan(uvec3(c), uvec3(max_c)));
+}
+
+void descend(vec3 p, inout TraversalState state, vec3 ro, vec3 rd, vec3 ird, vec3 srd, vec3 pos_rd, int axis_branching_factor, uint num_nodes)
+{
+    while (true)
+    {
+        TreeNode node = nodes.node_buffer[state.node_idx];
+
+        IF(!(state.node_idx < num_nodes && !is_leaf_node(node)))
+            break;
+
+        float child_size = state.node_size / float(axis_branching_factor);
+        ivec3 global = coord_from_world(p, child_size);
+        ivec3 local = get_local_coord(global, axis_branching_factor);
+        ivec3 child_coord = get_child_coord(state.coord, local, axis_branching_factor);
+
+        uint bit_index = flatten_index(local, axis_branching_factor);
+        state.coord = child_coord;
+        state.node_size = child_size;
+
+        IF(contains_child(node, bit_index))
+        {
+            uint child_idx = get_child_ptr(node, bit_index);
+            IF(is_leaf_node(nodes.node_buffer[child_idx]) && nodes.node_buffer[child_idx].data == 0)
+            {
+                break;
+            }
+                state.node_idx = child_idx;
+                state.depth++;
+        }
+        else
+            break;
+    }
+    state.plane_pos = plane_from_coord(state.coord, state.node_size, ivec3(pos_rd));
+    state.side_dist = plane_dist(state.plane_pos, ro, ird);
+}
+
+bool ascend(uint from_node_idx, inout TraversalState state, vec3 ro, vec3 rd, vec3 ird, ivec3 srd, vec3 pos_rd, int axis_branching_factor)
+{
+    state.coord = get_parent_coord(state.coord, axis_branching_factor);
+    state.node_idx = nodes.node_buffer[from_node_idx].parent;
+    state.node_size *= float(axis_branching_factor);
+    state.plane_pos = plane_from_coord(state.coord, state.node_size, ivec3(pos_rd));
+    state.side_dist = plane_dist(state.plane_pos, ro, ird);
+    IF(state.depth == 0u)
+        return false;
+    state.depth--;
+    return true;
+}
+
+#define INVALID_OFFSET uint(0xffffffffu)
+#define NORMAL_SIZE (1/1024.f)
+
+uint traverse_forward(inout raymarch_hit hit, TreeNode node, inout TraversalState state, vec3 ro, vec3 rd, vec3 ird, vec3 srd, vec3 pos_rd, vec3 delta_dist, int axis_branching_factor)
+{
+
+    #if 1
+    ivec3 parent_coord = get_parent_coord(state.coord, axis_branching_factor);
+    ivec3 parent_dir_coord = parent_coord + ivec3(pos_rd);
+    ivec3 exit_child_coord = parent_dir_coord * axis_branching_factor;
+    vec3 exit_plane_pos = vec3(exit_child_coord) * state.node_size;
+    vec3 exit_side_dist = plane_dist(exit_plane_pos, ro, ird);
+    float min_dist = compMin(exit_side_dist);
+
+    vec3 inv_normal = -get_min_mask(exit_side_dist) * srd * state.node_size * NORMAL_SIZE;
+    vec3 exit_pos = pos_along_ray(ro, rd, min_dist);
+
+    ivec3 exit_coord = coord_from_world(exit_pos + inv_normal, state.node_size);
+
+    uint64_t potential_children = get_children_along_ray(
+        get_local_coord(state.coord, axis_branching_factor),
+        get_local_coord(exit_coord, axis_branching_factor));
+    uint64_t mask = uint64_t(node.ChildMask0) | (uint64_t(node.ChildMask1) << uint64_t(32));
+
+    hit.iteration_count++;
+    IF((mask & potential_children) == 0UL)
+    {
+        return INVALID_OFFSET;
+    }
+    #endif
+
+    ivec3 entry = (state.coord / axis_branching_factor) * axis_branching_factor;
+    while (coord_in_bounds_lod(state.coord - entry, 1, axis_branching_factor))
+    {
+        vec3 min_mask = get_min_mask(state.side_dist);
+        ivec3 next_coord = state.coord + ivec3(min_mask) * ivec3(srd);
+
+        IF(!coord_in_bounds_lod(next_coord - entry, 1, axis_branching_factor))
+            break;
+
+        uint bit_index = flatten_index(get_local_coord(next_coord, axis_branching_factor), axis_branching_factor);
+        IF(contains_child(node, bit_index))
+        {
+            uint child_idx = get_child_ptr(node, bit_index);
+            IF(!(is_leaf_node(nodes.node_buffer[child_idx]) && nodes.node_buffer[child_idx].data == 0))
+            {
+                state.coord = next_coord;
+
+                return child_idx;
+            }
+        }
+
+        advance_plane(state.plane_pos, state.side_dist, state.coord, srd, delta_dist, state.node_size);
+        hit.iteration_count++;
+    }
+    return INVALID_OFFSET;
+}
+
+#define MAX_ITERATIONS 256
+#define INV_MAX_ITERATIONS (1.f/MAX_ITERATIONS)
+
+
+raymarch_hit raymarch_tree(float tree_size, vec3 ro, vec3 rd, uint node_idx)
+{
+    uint num_nodes = nodes.node_buffer.length();
+    raymarch_hit hit;
+    hit.t = T_MISS;
+    hit.data = 0u;
+    hit.iteration_count = 0;
+    hit.normal = vec3(0);
+
+    TraversalState state;
+    state.coord = ivec3(0);
+    state.node_idx = node_idx;
+    state.node_size = tree_size;
+    state.depth = 0u;
+
+    float t_entry;
+    float t_exit;
+    int axis;
+    bool hit_root = ray_cube_aabb(ro, rd, vec3(0), tree_size, t_entry, t_exit, axis);
+
+    IF(!hit_root)
+        return hit;
+    else
+        ro = pos_along_ray(ro, rd, t_entry + 0.0001f);
+
+    vec3 ird = get_safe_ird(rd);
+    ivec3 srd = ivec3(sign(ird));
+    vec3 delta_dist = abs(ird);
+    vec3 pos_rd = step(vec3(0.0), ird);
+
+    const int axis_branching_factor = 4;
+
+    state.plane_pos = floor(ro / state.node_size + pos_rd) * state.node_size;
+    state.coord = coord_from_world(ro, state.node_size);
+    state.side_dist = vec3(0.0);
+
+    descend(ro, state, ro, rd, ird, srd, pos_rd, axis_branching_factor, num_nodes);
+    
+    float prev_min_dist = 0.0;
+    vec3 prev_normal = vec3(0.f);
+    prev_normal[axis] = srd[axis];
+    for (int i = 0; i < MAX_ITERATIONS; i++)
+    {
+        TreeNode node = nodes.node_buffer[state.node_idx];
+
+        IF(!is_leaf_node(node))
+        {
+            uint first_node = traverse_forward(hit, node, state, ro, rd, ird, vec3(srd), pos_rd, delta_dist, axis_branching_factor);
+
+            IF(first_node == INVALID_OFFSET)
+            {
+                IF(!ascend(state.node_idx, state, ro, rd, ird, srd, pos_rd, axis_branching_factor))
+                    break;
+                continue;
+            }
+
+            state.node_idx = first_node;
+            state.depth++;
+
+            vec3 min_mask = get_min_mask(state.side_dist);
+            vec3 normal = min_mask * vec3(srd);
+            prev_min_dist = compMin(state.side_dist);
+            prev_normal = normal;
+
+            descend(normal * state.node_size * NORMAL_SIZE +
+                    pos_along_ray(ro, rd, compMin(state.side_dist)), 
+                    state, ro, rd, ird, srd, pos_rd, axis_branching_factor, num_nodes);
+        }
+        else IF(node.data != 0)
+        {
+            hit.t = t_entry + prev_min_dist;
+            hit.data = node.data;
+            hit.normal = prev_normal;
+            
+            return hit;
+        }
+
+        IF(state.node_idx == INVALID_OFFSET)
+            break;
+        hit.iteration_count++;
+    }
+
+    return hit;
+}
+
+struct storage_result
+{
+    bool leaf_hit;
+};
+
+bool will_leave_boundary(ivec3 c0, ivec3 c1)
+{
+    ivec3 dc = abs(c1 - c0);
+    return any(greaterThanEqual(dc, ivec3(3)));
+}
+
+storage_result sample_storage(uint num_nodes, inout uint idx, out int lod_step, ivec3 coord, ivec3 next_coord, inout bool retreating, vec3 pos_rd)
+{
+    ivec3 local = get_local_coord(coord, 4);
+    ivec3 next_local_coord = get_local_coord(next_coord, 4);
+    storage_result result;
+    result.leaf_hit = false;
+
+    TreeNode node = nodes.node_buffer[idx];
+    
+    IF(is_leaf_node(node) && node.data != 0)
+    {
+        result.leaf_hit = true;
+        return result;
+    }
+
+    uint bit_index = flatten_index(local, 4);
+    IF(contains_child(node, bit_index) && !retreating)
+    {
+        uint child_idx = get_child_ptr(node, bit_index);
+        IF(nodes.node_buffer[child_idx].data != 0)
+        {
+            idx = child_idx;
+            lod_step = 1;
+            return result;
+        }
+    }
+
+    IF(will_leave_boundary(local, next_local_coord))
+    {
+        retreating = true;
+        idx = node.parent;
+        lod_step = -1;
+        return result;
+    }
+
+    retreating = false;
+    lod_step = 0;
+
+    return result;
+}
+
+
+raymarch_hit raymarch_tree_1(float root_size, vec3 ro, vec3 rd, uint node_idx)
+{
+    uint num_nodes = nodes.node_buffer.length();
+
+    raymarch_hit hit;
+    hit.t = T_MISS;
+    hit.data = 0u;
+    hit.iteration_count = 0;
+
+    float t_entry;
+    float t_exit;
+    int axis;
+    bool hit_root = ray_cube_aabb(ro, rd, vec3(0), root_size, t_entry, t_exit, axis);
+    
+    IF(!hit_root)
+        return hit;
+    else
+        ro = pos_along_ray(ro, rd, t_entry + 0.001f);
+    
+    hit.t = t_entry;
+
+    vec3 ird = get_safe_ird(rd);
+    vec3 pos_rd = step(vec3(0.f), ird);
+    bool retreating = false;
+    int lod = 1;
+    ivec3 coord;
+    for (int i = 0; i < MAX_ITERATIONS; i++)
+    {
+        float voxel_size = root_size / pow(4.f, float(lod));
+
+        coord = coord_from_world(ro, voxel_size);
+
+        IF(!coord_in_bounds(coord, lod))
+            break;
+        
+        vec3 offset = mod(ro, voxel_size); // FIX: replace this with plane pos to get rid of infinite loops
+        vec3 target_pos = voxel_size * pos_rd;
+        vec3 side_dist = plane_dist(target_pos, offset, ird);
+
+        vec3 next_ro = pos_along_ray(ro, rd, compMin(side_dist) + 0.001f);
+        ivec3 next_coord = coord_from_world(next_ro, voxel_size);
+        
+        int dlod = 0;
+        storage_result result = sample_storage(num_nodes, node_idx, dlod, coord, next_coord, retreating, pos_rd);
+        lod += dlod;
+
+        IF(node_idx == INVALID_OFFSET)
+        {
+            break;
+        }
+
+        IF(result.leaf_hit)
+        {
+            hit.data = nodes.node_buffer[node_idx].data;
+            return hit;
+        }
+
+        IF(dlod == 0)
+        {
+            hit.t += compMin(side_dist);
+            ro = next_ro;
+        }
+        hit.iteration_count++;
+    }
+    hit.t = -1.f;
+    return hit;
+}
+
+raymarch_hit raymarch_tree_2(float root_size, vec3 ro, vec3 rd, uint node_idx)
+{
+    uint num_nodes = nodes.node_buffer.length();
+
+    raymarch_hit hit;
+    hit.t = T_MISS;
+    hit.data = 0u;
+    hit.iteration_count = 0;
+
+    float t_entry;
+    float t_exit;
+    int axis;
+    bool hit_root = ray_cube_aabb(ro, rd, vec3(0), root_size, t_entry, t_exit, axis);
+    
+    IF(!hit_root)
+        return hit;
+    
+    hit.t = t_entry;
+
+    vec3 ird = get_safe_ird(rd);
+    vec3 pos_rd = step(vec3(0.f), ird);
+    bool retreating = false;
+    int lod = 1;
+    vec3 side_dist = vec3(0.f);
+    ivec3 srd = ivec3(sign(rd));
+    for (int i = 0; i < MAX_ITERATIONS; i++)
+    {
+        float voxel_size = root_size / pow(4.f, float(lod));
+
+        ivec3 coord = coord_from_world(NORMAL_SIZE * get_min_mask(side_dist) * srd + pos_along_ray(ro, rd, compMin(side_dist)), voxel_size);
+        IF(!coord_in_bounds(coord, lod))
+            break;
+
+        vec3 plane_pos = plane_from_coord(coord, voxel_size, ivec3(pos_rd));
+        vec3 new_side_dist = plane_dist(plane_pos, ro, ird);
+        
+        ivec3 next_coord = coord_from_world(NORMAL_SIZE * get_min_mask(new_side_dist) * srd + pos_along_ray(ro, rd, compMin(new_side_dist)), voxel_size);
+        
+        int dlod = 0;
+        storage_result result = sample_storage(num_nodes, node_idx, dlod, coord, next_coord, retreating, pos_rd);
+        lod += dlod;
+
+        IF(node_idx == INVALID_OFFSET)
+        {
+            hit.t = T_MISS;
+            break;
+        }
+
+        IF(result.leaf_hit)
+        {
+            hit.data = nodes.node_buffer[node_idx].data;
+            hit.t = compMin(side_dist);
+            return hit;
+        }
+
+        IF(dlod == 0)
+        {
+            side_dist = new_side_dist;
+        }
+        hit.iteration_count++;
+    }
+    hit.t = -1.f;
+    return hit;
+}
+
+struct TraversalPosition {
+    ivec3 coord;
+    vec3 plane_pos;
+    vec3 side_dist;
+};
+
+raymarch_hit raymarch_tree_3(float root_size, vec3 ro, vec3 rd, uint node_idx)
+{
+    raymarch_hit hit;
+    hit.t = 0.0;
+    hit.data = 0;
+
+    vec3 ird = get_safe_ird(rd);
+    vec3 delta_dist = abs(ird);
+    ivec3 srd = ivec3(sign(ird));
+    vec3 pos_rd = step(vec3(0.0), ird);
+
+    bool retreating = false;
+    int lod = 1;
+    float voxel_size = root_size / pow(4.0, float(lod));
+
+    TraversalPosition tr;
+    tr.coord = coord_from_world(ro, voxel_size);
+    tr.plane_pos = plane_from_coord(tr.coord, voxel_size, ivec3(pos_rd));
+    tr.side_dist = plane_dist(tr.plane_pos, ro, ird);
+
+    for (int i = 0; i < MAX_ITERATIONS; i++)
+    {
+        voxel_size = root_size / pow(4.0, float(lod));
+
+        IF(!coord_in_bounds(tr.coord, lod))
+        {
+            hit.t = T_MISS;
+            break;
+        }
+
+        vec3 min_mask = get_min_mask(tr.side_dist);
+        vec3 normal = min_mask * 0.1 * vec3(srd);
+
+        TraversalPosition tr1 = tr;
+        advance_plane(tr1.plane_pos, tr1.side_dist, tr1.coord, srd, delta_dist, voxel_size);
+        
+        int dlod = 0;
+        storage_result result = sample_storage(nodes.node_buffer.length(), node_idx, dlod, tr.coord, tr1.coord, retreating, pos_rd);
+        lod += dlod;
+
+        IF(node_idx == INVALID_OFFSET)
+        {
+            hit.t = T_MISS;
+            break;
+        }
+
+        IF(result.leaf_hit)
+        {
+            hit.t = min(tr.side_dist.x, tr.side_dist.y);
+            hit.data = nodes.node_buffer[node_idx].data; // Assuming nodes are bound via SSBO/buffer
+            return hit;
+        }
+
+        IF(dlod == 1)
+        {
+            tr.coord = coord_from_world(normal + ro + rd * hit.t, voxel_size / 4.0);
+            tr.plane_pos = plane_from_coord(tr.coord, voxel_size / 4.0, ivec3(pos_rd));
+            tr.side_dist = plane_dist(tr.plane_pos, ro, ird);
+        }
+
+        IF(dlod == 0)
+        {
+            hit.t = min(tr.side_dist.x, tr.side_dist.y);
+            tr = tr1;
+        }
+
+        IF(dlod == -1)
+        {
+            tr.coord /= 4;
+            tr.plane_pos = plane_from_coord(tr.coord, voxel_size * 4.0, ivec3(pos_rd));
+            tr.side_dist = plane_dist(tr.plane_pos, ro, ird);
+        }
+    }
+
+    hit.t = T_MISS;
+    return hit;
+}
+
+vec3 hash_color(uint data)
+{
+    vec3 c;
+    c.r = ((data >> 0) & 0xffu) / float(0xffu);
+    c.g = ((data >> 4) & 0xffu) / float(0xffu);
+    c.b = ((data >> 8) & 0xffu) / float(0xffu);
+    return c;
+    return vec3
+    (
+        (data * 195111 + 1499191) % 255,
+        (data * 578827 + 7827876) % 255,
+        (data * 687786 + 2576785) % 255
+    )/255.f;
+}
+
+bool will_leave(ivec3 local_c0, ivec3 local_c1, ivec3 srd, int axis_branching_factor)
+{
+    ivec3 dt = local_c0 - local_c1;
+    return any(equal(dt, srd * (axis_branching_factor - 1)));
+}
+
+raymarch_hit raymarch_tree_4(float root_size, vec3 ro, vec3 rd, uint node_idx)
+{
+    raymarch_hit hit;
+    hit.t = 0.f;
+    hit.iteration_count = 0;
+    hit.data = 0;
+
+    vec3 ird = get_safe_ird(rd);
+    vec3 delta_dist = abs(ird);
+    ivec3 srd = ivec3(sign(ird));
+    ivec3 pos_rd = ivec3(step(vec3(0.f), ird));
+    int axis_branching_factor = 4;
+    bool descending = false;
+
+    
+    int lod = 1;
+    float voxel_size = root_size / pow(4.f, float(lod));
+
+    vec3 side_dist = vec3(0.f);
+    ivec3 coord = coord_from_world(ro, voxel_size);
+
+    while (true)
+    {
+        voxel_size = root_size / pow(4.f, float(lod));
+        coord = coord_from_world(ro, voxel_size);
+        
+        ivec3 local = get_local_coord(coord, axis_branching_factor);
+        uint bit_index = flatten_index(local, axis_branching_factor);
+        IF(contains_child(nodes.node_buffer[node_idx], bit_index))
+        {
+            uint child_idx = get_child_ptr(nodes.node_buffer[node_idx], bit_index);
+            node_idx = child_idx;
+            lod++;
+        }
+        else break;
+        hit.iteration_count++;
+    }
+
+    for (int i = 0; i < MAX_ITERATIONS; i++)
+    {
+        hit.iteration_count++;
+        TreeNode node = nodes.node_buffer[node_idx];
+        IF(is_leaf_node(node) && node.data != 0)
+        {
+            hit.t = compMin(side_dist);
+            hit.data = node.data;
+            return hit;
+        }
+
+        vec3 plane_pos = plane_from_coord(coord, voxel_size, pos_rd);
+        
+        
+        side_dist = plane_dist(plane_pos, ro, ird);
+        vec3 min_mask = get_min_mask(side_dist);
+        vec3 normal = min_mask * vec3(srd) * 0.001f;
+        float min_dist = compMin(side_dist);
+
+        ivec3 next_coord = coord_from_world(normal + ro + rd * min_dist, voxel_size);
+
+        IF(will_leave(coord % 4, next_coord % 4, srd, axis_branching_factor) && !descending)
+        {
+            node_idx = node.parent;
+            lod--;
+            voxel_size *= 4.f;
+            coord = get_parent_coord(coord, axis_branching_factor);
+            IF(node_idx == INVALID_OFFSET)
+                break;
+            continue;
+        }
+        else
+            coord = next_coord;
+        
+        IF(!coord_in_bounds(coord, lod))
+            break;
+
+        ivec3 local = get_local_coord(coord, axis_branching_factor);
+        uint bit_index = flatten_index(local, axis_branching_factor);
+        descending = contains_child(node, bit_index);
+        IF(descending)
+        {
+            uint child_idx = get_child_ptr(node, bit_index);
+            IF(nodes.node_buffer[child_idx].data == 0)
+            {
+                descending = false;
+                continue;
+            }
+            node_idx = child_idx;
+            lod++;
+            voxel_size /= 4.f;
+            coord = coord_from_world(-normal + ro + rd * min_dist, voxel_size);
+        }
+    
+    }
+
+    return hit;
+}
+
+
+const int RenderMode_ALBEDO = 0;
+const int RenderMode_DEPTH = 1;
+const int RenderMode_CLOCK = 2;
+const int RenderMode_ITERATION = 3;
+const int RenderMode_BRANCHING = 4;
+const int RenderMode_NORMALS = 5;
+const int RenderMode_count = 6;
+
+const int TraceVersion_0 = 0;
+const int TraceVersion_1 = 1;
+const int TraceVersion_2 = 2;
+const int TraceVersion_3 = 3;
+const int TraceVersion_4 = 4;
+
+ChunkData get_chunk_root(ivec3 chunk_key)
+{
+    if (any(greaterThanEqual(chunk_key, u_chunk_counts)) || any(lessThan(chunk_key, ivec3(0))))
+    {
+        ChunkData data;
+        data.root_idx = 0;
+        data.num_nodes = 0;
+        return data;
+    }
+
+    int index = chunk_key.x + chunk_key.y * u_chunk_counts.x + chunk_key.z * u_chunk_counts.x * u_chunk_counts.y;
+    return chunks.chunks[index];
+}
+
+raymarch_hit raymarch_world(float root_size, vec3 ro, vec3 rd)
+{
+    raymarch_hit hit;
+    hit.t = T_MISS;
+    
+    vec3 ird = get_safe_ird(rd);
+    vec3 pos_rd = step(vec3(0.f), ird);
+    vec3 srd = sign(ird);
+    vec3 delta_dist = abs(ird);
+    
+    ivec3 chunk_coord = coord_from_world(ro, root_size);
+    vec3 chunk_plane = plane_from_coord(chunk_coord, root_size, ivec3(pos_rd));
+    vec3 side_dist = plane_dist(chunk_plane, ro, ird); // Fixed argument order for plane_dist? Check your signature
+    int iterations = 0;
+    for (int i = 0; i < 10; i++)
+    {
+        vec3 local_ro = ro - vec3(chunk_coord) * root_size;
+        ChunkData chunk_data = get_chunk_root(chunk_coord);
+
+        IF(is_valid_chunk(chunk_data))
+        {
+            IF(u_TraceVersion == TraceVersion_0)
+                hit = raymarch_tree(root_size, local_ro, rd, 0);
+            else IF(u_TraceVersion == TraceVersion_1)
+                hit = raymarch_tree_1(root_size, local_ro, rd, 0);
+            else IF(u_TraceVersion == TraceVersion_2)
+                hit = raymarch_tree_2(root_size, local_ro, rd, 0);
+            else IF(u_TraceVersion == TraceVersion_3)
+                hit = raymarch_tree_3(root_size, local_ro, rd, 0);
+            else IF(u_TraceVersion == TraceVersion_4)
+                hit = raymarch_tree_4(root_size, local_ro, rd, 0);
+            iterations += hit.iteration_count;
+        }
+        
+        IF(hit.t != T_MISS)
+            break;
+
+        advance_plane(chunk_plane, side_dist, chunk_coord, srd, delta_dist, root_size);
+    }
+    hit.iteration_count = iterations;
+    return hit;
+}
+
+void main() 
+{
+
+    ivec2 screen_coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 img_size = imageSize(u_ScreenImage);
+
+    vec2 ndc = (vec2(screen_coords) + 0.5f) / vec2(img_size) * 2.0f - 1.0f;
+    
+    vec4 clip = u_InvProj * vec4(ndc, 1.0f, 1.0f);
+    clip /= clip.w;
+    vec4 world_pos = u_InvView * clip;
+
+    vec3 ro = u_CameraPosition;
+    vec3 rd = normalize(world_pos.xyz - ro);
+    vec3 color;
+
+    vec3 root_origin = vec3(0.0f);
+    float root_size = 128.0f;
+    uint max_depth = 8u;
+
+    raymarch_hit hit;
+    uint64_t t0 = clockARB();
+#if 1
+    IF(u_TraceVersion == TraceVersion_0)
+        hit = raymarch_tree(root_size, ro, rd, 0);
+    else IF(u_TraceVersion == TraceVersion_1)
+        hit = raymarch_tree_1(root_size, ro, rd, 0);
+    else IF(u_TraceVersion == TraceVersion_2)
+        hit = raymarch_tree_2(root_size, ro, rd, 0);
+    else IF(u_TraceVersion == TraceVersion_3)
+        hit = raymarch_tree_3(root_size, ro, rd, 0);
+    else IF(u_TraceVersion == TraceVersion_4)
+        hit = raymarch_tree_4(root_size, ro, rd, 0);
+#else
+    hit = raymarch_world(root_size, ro, rd);
+#endif
+    uint64_t t1 = clockARB();
+
+    switch(u_RenderMode)
+    {
+        case RenderMode_ALBEDO:
+            color = hash_color(hit.data);
+            break;
+        case RenderMode_CLOCK:
+            color = vec3(float(t1 - t0)/1024.f/256.f);
+            break;
+        case RenderMode_DEPTH:
+            color = vec3(hit.t/root_size);
+            break;
+        case RenderMode_ITERATION:
+            color = vec3((hit.iteration_count * INV_MAX_ITERATIONS));
+            break;
+        case RenderMode_BRANCHING:
+            color = vec3(((float(t1 - t0)/1024.f/256.f)*(1.f - get_branch_efficiency())));
+            break;
+        case RenderMode_NORMALS:
+             color = hash_color(hit.data);
+             color *= max(0.2, dot(hit.normal, normalize(vec3(0.25f, 0.7f, 0.4f))));
+            break;
+        default:
+            break;
+    }
+    
+
+    imageStore(u_ScreenImage, screen_coords, vec4(color, 1.0f));
+}

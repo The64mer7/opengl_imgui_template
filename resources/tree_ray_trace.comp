@@ -1,0 +1,577 @@
+#version 450 core
+#extension GL_ARB_gpu_shader_int64 : enable
+#extension GL_ARB_shader_clock : enable
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba8, binding = 0) uniform image2D u_ScreenImage;
+
+uniform mat4 u_InvView;
+uniform mat4 u_InvProj;
+uniform vec3 u_CameraPosition;
+uniform int u_RenderMode;
+
+
+struct TreeNode
+{
+    uint Data;
+    uint ChildMask0;
+    uint ChildMask1;
+    uint ChildIndex;
+    uint ParentIndex;
+};
+
+const uint sizeof_TreeNode = 20;
+
+layout(std430, binding = 0) buffer ContreeLookupTable
+{
+    uint64_t table[];
+};
+
+layout(std430, binding = 1) buffer TreeNodes
+{
+    TreeNode data[];
+} nodes;
+
+int coord_to_index(ivec3 c)
+{
+    return c.x + 4*c.y + 16*c.z;
+}
+
+uint64_t get_children_along_ray(ivec3 c0, ivec3 c1)
+{
+    int i0 = coord_to_index(c0);
+    int i1 = coord_to_index(c1);
+
+    int i = i1 + (4*4*4)*i0;
+
+    return table[i];
+}
+
+bool ray_cube_aabb(
+    vec3 ro,
+    vec3 rd,
+    vec3 aabb_min,
+    float size,
+    out float t_entry,
+    out float t_exit,
+    out int axis
+) 
+{
+    vec3 aabb_max = aabb_min + vec3(size);
+    vec3 ird = 1.0f / rd;
+
+    vec3 tmin = (aabb_min - ro) * ird;
+    vec3 tmax = (aabb_max - ro) * ird;
+
+    vec3 t_entries = min(tmin, tmax);
+    vec3 t_exits = max(tmin, tmax);
+
+    t_entry = max(t_entries.x, max(t_entries.y, t_entries.z));
+    t_exit = min(t_exits.x, min(t_exits.y, t_exits.z));
+
+    axis = (t_entry == t_entries.x) ? 0 : ((t_entry == t_entries.y) ? 1 : 2);
+
+    t_entry = max(t_entry, 0.0f);
+    return t_entry <= t_exit;
+}
+
+bool ray_aabb_intersect(
+    vec3 ro,
+    vec3 rd,
+    vec3 aabb_min,
+    vec3 aabb_max
+) 
+{
+    vec3 ird = 1.0f / rd;
+
+    vec3 tmin = (aabb_min - ro) * ird;
+    vec3 tmax = (aabb_max - ro) * ird;
+
+    vec3 t_entries = min(tmin, tmax);
+    vec3 t_exits = max(tmin, tmax);
+
+    float t_entry = max(t_entries.x, max(t_entries.y, t_entries.z));
+    float t_exit = min(t_exits.x, min(t_exits.y, t_exits.z));
+
+    t_entry = max(t_entry, 0.0f);
+    return t_entry <= t_exit;
+}
+
+bool did_hit(vec2 t)
+{
+    return t.x <= t.y && t.y >= 0.0f;
+}
+
+vec3 iron_bow_palette(float t) 
+{
+    vec3 col;
+    col.x = 1.3270999099f * t * t * t - 3.89901684973f * t * t + 3.70960910156f * t - 0.15278320312f;
+    col.y = 7.65954617763f * t * t * t * t * t - 22.5537957158f * t * t * t * t + 21.3487765665f * t * t * t - 5.91855168371f * t * t + 0.47468132421f * t - 0.00631664062f;
+    col.z = 0.56412587921f * t * t * t * t * t - 1.4419923514f * t * t * t * t + 13.304582114f * t * t * t - 17.0301531828f * t * t + 5.49549730469f * t + 0.1190078125f;
+    return col;
+}
+
+uint branch_seed = 191122u;
+
+#define ENABLE_BRANCH_LOGGING 0
+
+#if ENABLE_BRANCH_LOGGING
+void branch(uint branch_id)
+{
+    branch_seed ^= branch_id;
+    branch_seed *= 1681781941u;
+    branch_seed = (branch_seed >> 11) | (branch_seed << 22);
+}
+#else
+    #define branch(branch_id) do {} while (false)
+#endif
+
+float branch_value()
+{
+    return branch_seed / float(0xffffffffu);
+}
+
+vec3 branch_color()
+{
+    vec3 c;
+    c.r = ((branch_seed >> 0) & 0xff) / float(0xff);
+    c.g = ((branch_seed >> 8) & 0xff) / float(0xff);
+    c.b = ((branch_seed >> 16) & 0xff) / float(0xff);
+    return c;
+}
+
+struct Hit
+{
+    bool hit;
+    int normal;
+    float t;
+    uint Data;
+    uint iteration_count;
+    uint depth;
+    vec3 debug;
+};
+
+Hit miss()
+{
+    Hit hit_result;
+    hit_result.hit = false;
+    hit_result.normal = 0;
+    hit_result.t = 0.0f;
+    hit_result.Data = 0;
+    hit_result.iteration_count = 0;
+    hit_result.depth = 0;
+    return hit_result;
+}
+
+struct DDAState
+{
+    ivec3 min_indices;
+    vec3 ird;
+    vec3 prev_side_dist;
+    vec3 side_dist;
+    vec3 delta_dist;
+    ivec3 map;
+    ivec3 map_step;
+    ivec3 map_offset;
+};
+
+void update_next_step_min_indices(inout DDAState dda)
+{
+    dda.min_indices = ivec3(lessThanEqual(
+        dda.side_dist.xyz, 
+        min(
+        dda.side_dist.yzx, 
+        dda.side_dist.zxy)));
+}
+
+void dda_step(inout DDAState dda, float step_size)
+{
+    dda.prev_side_dist = dda.side_dist;
+    
+    update_next_step_min_indices(dda);
+    dda.side_dist += vec3(dda.min_indices) * dda.delta_dist * step_size;
+    dda.map += dda.min_indices * dda.map_step;
+}
+
+ivec3 get_next_step_map(inout DDAState dda)
+{
+    update_next_step_min_indices(dda);
+    return dda.map + dda.min_indices * dda.map_step;
+}
+
+float comp_min(vec3 v)
+{
+    return min(v.x, min(v.y, v.z));
+}
+
+float prev_min_side_dist(inout DDAState dda)
+{
+    return comp_min(dda.prev_side_dist);
+}
+
+float min_side_dist(inout DDAState dda)
+{
+    return comp_min(dda.side_dist);
+}
+
+int min_axis(vec3 v)
+{
+    int axis = 0;
+    for (int a = 0; a < 3; a++)
+    {
+        if (v[a] < v[axis])
+            axis = a;
+    }
+    return axis;
+}
+
+void init_dda(inout DDAState dda, vec3 ro, vec3 rd, float cell_size)
+{
+    dda.ird = sign(rd) / max(abs(rd), 0.0001f);
+    dda.map_offset = ivec3(step(0.0f, rd));
+    dda.map_step = dda.map_offset * 2 - 1;
+
+    dda.map = ivec3(floor(ro / cell_size));
+    vec3 next_plane = vec3(dda.map + dda.map_offset) * cell_size;
+    dda.delta_dist = abs(dda.ird) * cell_size;
+    dda.side_dist = (next_plane - ro) * dda.ird;
+    dda.prev_side_dist = vec3(0.0f);
+}
+
+bool contains_child(TreeNode node, uint index)
+{
+    return (
+        (index < 32 && (node.ChildMask0 & (1u << index)) != 0u) ||
+        (index >= 32 && (node.ChildMask1 & (1u << (index - 32u))) != 0u)
+    );
+}
+
+vec3 get_side_dist_to_plane(vec3 plane, vec3 origin, vec3 ird)
+{
+    vec3 side_dist = (plane - origin) * ird;
+    return max(vec3(0.0f), side_dist);
+}
+
+ivec3 div_floor(vec3 v, float scale)
+{
+    return ivec3(floor(v / scale));
+}
+
+uint get_child_offset(TreeNode node, uint bit_index)
+{
+    uint child_offset = 0;
+    if (bit_index < 32u)
+        child_offset = bitCount(node.ChildMask0 & ((1u << bit_index) - 1u));
+    else
+        child_offset = bitCount(node.ChildMask0) + bitCount(node.ChildMask1 & ((1u << (bit_index - 32u)) - 1u));
+    return child_offset;
+}
+
+uint get_child_ptr(TreeNode node, uint bit_index)
+{
+    return node.ChildIndex + get_child_offset(node, bit_index);
+}
+
+bool is_leaf_node(TreeNode node)
+{
+    return node.ChildMask0 == 0u && node.ChildMask1 == 0u;
+}
+
+vec3 decode_normal(int code)
+{
+    vec3 normal = vec3(0.0f);
+    normal[abs(code) - 1] = sign(code);
+    return normal;
+}
+
+int encode_normal(int axis, ivec3 ray_sign)
+{
+    return -(axis + 1) * ray_sign[axis];
+}
+
+void decode_aabb(TreeNode node, vec3 parent_origin, float parent_size, out vec3 out_min, out vec3 out_max)
+{
+    uint aabb_bits = node.Data;
+    out_min.x = float((aabb_bits >> 0u) & 0x3u);
+    out_min.y = float((aabb_bits >> 2u) & 0x3u);
+    out_min.z = float((aabb_bits >> 4u) & 0x3u);
+    out_max.x = float((aabb_bits >> 6u) & 0x3u);
+    out_max.y = float((aabb_bits >> 8u) & 0x3u);
+    out_max.z = float((aabb_bits >> 10u) & 0x3u);
+
+    float children_size = parent_size;
+    out_min = parent_origin + out_min * children_size;
+    out_max = parent_origin + (out_max + 1u) * children_size;
+}
+
+#define MAX_ITERATIONS 256
+#define INV_MAX_ITERATIONS (1.0f / MAX_ITERATIONS)
+
+#define OPTIMIZE_NONE 0
+#define OPTIMIZE_AABB 1
+#define OPTIMIZE_LUT 2
+
+
+#define OPTIMIZE OPTIMIZE_NONE
+
+Hit raymarch_sv_tree(vec3 ro, vec3 rd, vec3 root_origin, float root_size, uint max_depth, uint root_node, uint node_end)
+{
+    DDAState dda;
+    Hit hit = miss();
+
+    float children_size = root_size * 0.25f;
+    float eps = children_size * 1.0f / 1024.0f;
+    hit.debug = vec3(0.0f);
+    float t_root_entry, t_root_exit;
+    int root_axis;
+
+#if OPTIMIZE == OPTIMIZE_AABB
+    vec3 a_min, a_max;
+    decode_aabb(nodes.data[root_node], root_origin, children_size, a_min, a_max);
+    if (!ray_aabb_intersect(ro, rd, a_min, a_max))
+    {
+        branch(0);
+        hit.t = 1e30f;
+        return hit;
+    }
+#endif
+
+    if (!ray_cube_aabb(ro, rd, root_origin, root_size, t_root_entry, t_root_exit, root_axis))
+    {
+        branch(1);
+        hit.t = 1e30f;
+        return hit;
+    }
+    
+    t_root_entry = max(t_root_entry, 0.0f);
+
+    ro -= root_origin;
+    ro = ro + rd * (t_root_entry + eps);
+    init_dda(dda, ro, rd, children_size);
+
+    if (is_leaf_node(nodes.data[root_node]))
+    {
+        branch(0xff);
+        hit.t = t_root_entry;
+        hit.normal = encode_normal(root_axis, dda.map_step);
+        hit.hit = true;
+        return hit;
+    }
+
+    uint parent_node = root_node;
+    uint depth = 0;
+    int min_axis_val = int(root_axis);
+    vec3 child_origin = vec3(dda.map) * children_size;
+    float prev_hit_t = 0.0f;
+    bool is_ascending = false;
+
+    while (hit.t <= t_root_exit - t_root_entry + eps && hit.iteration_count < MAX_ITERATIONS)
+    {
+        branch(1);
+        hit.iteration_count++;
+
+        TreeNode node = nodes.data[parent_node];
+
+        if (!is_ascending)
+        {
+            branch(3);
+            ivec3 child_indices = dda.map % 4;
+            
+            uint child_index = child_indices.x + 4 * child_indices.y + child_indices.z * 16;
+
+            if (contains_child(node, child_index))
+            {
+                branch(4);
+                uint child_node = root_node + get_child_ptr(node, child_index);
+                if (child_node == root_node || child_node >= node_end)
+                {
+                    branch(5);
+                    hit.t = 1e30f;
+                    return hit;
+                }
+
+                TreeNode child = nodes.data[child_node];
+                bool is_leaf = is_leaf_node(child);
+                is_leaf = is_leaf || depth == max_depth;
+
+                bool can_descend = true;
+                if (!is_leaf)
+                {
+                    branch(32);
+#if OPTIMIZE == OPTIMIZE_AABB
+                    float descend_children_size = children_size * 0.25f;
+                    decode_aabb(child, child_origin, descend_children_size, a_min, a_max);
+                    can_descend = ray_aabb_intersect(ro, rd, a_min, a_max);
+#endif
+#if OPTIMIZE == OPTIMIZE_LUT
+                    uint64_t potential_children = get_children_along_ray(ivec3(child_indices.x,0,0), ivec3(child_indices.x+4,0,0)); // TODO: not optimization yet
+                    uint potential_children_low = uint(potential_children);
+                    uint potential_children_high = uint(potential_children >> 32);
+                    if ((potential_children_high & node.ChildMask1) == 0 && (potential_children_low & node.ChildMask0) == 0)
+                        can_descend = false;
+#endif
+                    if (!can_descend)
+                    {
+                        branch(3223);
+                        vec3 next_plane = child_origin + vec3(dda.map_offset) * children_size;
+                        dda.side_dist = get_side_dist_to_plane(next_plane, ro, dda.ird);
+                        hit.t = min_side_dist(dda);
+                        min_axis_val = min_axis(dda.prev_side_dist);
+                    }
+                }
+
+                if (can_descend)
+                {
+                    branch(623);
+                    parent_node = child_node;
+                    
+                    bool is_solid = child.Data != 0;
+                    if (is_leaf && is_solid)
+                    {
+                        branch(6);
+                        hit.t = prev_hit_t + t_root_entry;
+                        hit.Data = child.Data;
+                        hit.hit = true;
+                        hit.normal = encode_normal(min_axis_val, dda.map_step);
+                        return hit;
+                    }
+
+                    children_size *= 0.25f;
+                    ivec3 parents_map = 4 * dda.map;
+                    dda.delta_dist *= 0.25f;
+                    
+                    vec3 veps = vec3(0.0f);
+                    veps[min_axis_val] = dda.map_step[min_axis_val] * eps;
+                    vec3 descend_pos = ro + rd * prev_hit_t + veps;
+
+                    dda.map = div_floor(descend_pos, children_size);
+                    dda.map = dda.map % 4 + parents_map;
+
+                    child_origin += children_size * vec3(dda.map % 4);
+                    depth++;
+                    eps *= 0.25f;
+                    continue;
+                }
+            }
+            else 
+            {
+                branch(7);
+                vec3 next_plane = child_origin + vec3(dda.map_offset) * children_size;
+                dda.side_dist = get_side_dist_to_plane(next_plane, ro, dda.ird);
+                hit.t = min_side_dist(dda);
+                min_axis_val = min_axis(dda.prev_side_dist);
+            }
+        }
+
+        ivec3 next_map = get_next_step_map(dda) & 3;
+        bool leaving_parent = any(equal(abs((dda.map & 3) - next_map), ivec3(3)));
+
+        if (leaving_parent)
+        {
+            branch(8);
+            if (parent_node != root_node)
+            {
+                branch(9);
+                parent_node = root_node + nodes.data[parent_node].ParentIndex;
+
+                float parent_size = children_size * 4.0f;
+                dda.map /= 4;
+                vec3 parent_origin = parent_size * vec3(floor((child_origin + children_size * 0.5f) / parent_size));
+
+                vec3 next_plane = parent_origin + vec3(dda.map_offset) * parent_size;
+                dda.delta_dist *= 4.0f;
+
+                dda.prev_side_dist = dda.side_dist;
+                dda.side_dist = (next_plane - ro) * dda.ird;
+
+                child_origin = parent_origin;
+                children_size = parent_size;
+
+                prev_hit_t = hit.t;
+                hit.t = min_side_dist(dda);
+
+                depth--;
+                eps *= 4.0f;
+                is_ascending = true;
+                continue;
+            }
+            else
+            {
+                branch(10);
+                hit.t = 1e30f;
+                return hit;
+            }
+        }
+
+        vec3 side_dist_delta = dda.side_dist - dda.prev_side_dist;
+        dda_step(dda, 1.0f);
+        is_ascending = false;
+        child_origin += children_size * vec3(dda.min_indices * dda.map_step);
+        min_axis_val = min_axis(dda.prev_side_dist);
+
+        prev_hit_t = hit.t;
+        hit.t = min_side_dist(dda);
+    }
+    return hit;
+}
+
+vec3 hash_color(uint data)
+{
+    return vec3
+    (
+        (data * 195111 + 1499191) % 255,
+        (data * 578827 + 7827876) % 255,
+        (data * 687786 + 2576785) % 255
+    )/255.f;
+}
+
+const int RenderMode_ALBEDO = 0;
+const int RenderMode_DEPTH = 1;
+const int RenderMode_CLOCK = 2;
+const int RenderMode_ITERATION = 3;
+const int RenderMode_count = 4;
+
+
+void main() 
+{
+    ivec2 screen_coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 img_size = imageSize(u_ScreenImage);
+
+    vec2 ndc = (vec2(screen_coords) + 0.5f) / vec2(img_size) * 2.0f - 1.0f;
+
+    vec4 clip = u_InvProj * vec4(ndc, 1.0f, 1.0f);
+    clip /= clip.w;
+    vec4 world_pos = u_InvView * clip;
+
+    vec3 ro = u_CameraPosition;
+    vec3 rd = normalize(world_pos.xyz - ro);
+    vec3 color;
+
+    vec3 root_origin = vec3(0.0f);
+    float root_size = 128.0f;
+    uint max_depth = 8u;
+
+    uint64_t t0 = clockARB();
+    Hit hit = raymarch_sv_tree(ro, rd, root_origin, root_size, max_depth, 0u, nodes.data.length());
+    uint64_t t1 = clockARB();
+
+    switch(u_RenderMode)
+    {
+        case RenderMode_ALBEDO:
+            color = hash_color(hit.Data);
+            break;
+        case RenderMode_CLOCK:
+            color = vec3(float(t1 - t0)/1024.f/256.f);
+            break;
+        case RenderMode_DEPTH:
+            color = vec3(hit.t/root_size);
+            break;
+        case RenderMode_ITERATION:
+            color = vec3(hit.iteration_count * INV_MAX_ITERATIONS);
+            break;
+        default:
+            break;
+    }
+
+    imageStore(u_ScreenImage, screen_coords, vec4(color, 1.0f));
+}
